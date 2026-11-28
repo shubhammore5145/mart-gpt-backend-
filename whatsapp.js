@@ -50,6 +50,8 @@ function getSessionState(shopId = 'default') {
       clientInfo: null,
       lastError: null,
       reconnectTimer: null,
+      reconnectAttempts: 0,
+      qrEmittedCount: 0,
       isConnecting: false,
       authDir: getAuthDir(cleanId)
     });
@@ -267,6 +269,16 @@ async function connectShop(shopId = 'default') {
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
+        session.qrEmittedCount = (session.qrEmittedCount || 0) + 1;
+        // Stop generating endless QRs forever if nobody scans after 3 rotations (~3 mins)
+        if (session.qrEmittedCount > 3 && !hasSavedCredentials(cleanId)) {
+          console.log(`[WhatsApp - Shop ${cleanId}] QR scan timed out; pausing session cleanly.`);
+          session.clientStatus = 'DISCONNECTED';
+          session.qrCodeDataUrl = null;
+          session.lastError = 'QR code expired. Click "Start Local WhatsApp Bot" to generate a new QR.';
+          try { sock.ws?.close(); } catch {}
+          return;
+        }
         session.clientStatus = 'NEEDS_QR';
         try {
           session.qrCodeDataUrl = await qrcode.toDataURL(qr, { margin: 2, scale: 7 });
@@ -280,6 +292,8 @@ async function connectShop(shopId = 'default') {
         session.clientStatus = 'CONNECTED';
         session.qrCodeDataUrl = null;
         session.lastError = null;
+        session.reconnectAttempts = 0;
+        session.qrEmittedCount = 0;
         const me = sock?.user;
         if (me) {
           session.clientInfo = {
@@ -327,18 +341,32 @@ async function connectShop(shopId = 'default') {
           session.clientStatus = 'PAIRING';
           session.qrCodeDataUrl = null;
           session.lastError = null;
+          session.reconnectAttempts = 0;
           if (session.reconnectTimer) clearTimeout(session.reconnectTimer);
           session.reconnectTimer = setTimeout(async () => {
             session.isConnecting = false;
             try { await connectShop(cleanId); } catch {}
-          }, 1200);
+          }, 1500);
+        } else if (!hasSavedCredentials(cleanId)) {
+          // Never infinite-loop on an unpaired QR session
+          session.clientStatus = 'DISCONNECTED';
+          session.qrCodeDataUrl = null;
+          session.lastError = 'QR session closed before scanning. Click Start Bot when ready to scan.';
         } else {
+          session.reconnectAttempts = (session.reconnectAttempts || 0) + 1;
+          if (session.reconnectAttempts > 8) {
+            console.warn(`[WhatsApp - Shop ${cleanId}] Stopped auto-reconnect after 8 failed attempts to prevent infinite loop.`);
+            session.clientStatus = 'DISCONNECTED';
+            session.lastError = 'WhatsApp disconnected repeatedly. Please check your phone or reconnect in Settings.';
+            return;
+          }
+          const delayMs = Math.min(300000, 5000 * Math.pow(2, session.reconnectAttempts - 1));
           session.clientStatus = 'CONNECTING';
           if (session.reconnectTimer) clearTimeout(session.reconnectTimer);
           session.reconnectTimer = setTimeout(async () => {
             session.isConnecting = false;
             try { await connectShop(cleanId); } catch {}
-          }, 3000);
+          }, delayMs);
         }
       }
     });
@@ -375,6 +403,8 @@ function initializeWhatsApp(shopId = 'default') {
   if (session.clientStatus === 'CONNECTED' || session.clientStatus === 'PAIRING' || session.isConnecting) {
     return;
   }
+  session.reconnectAttempts = 0;
+  session.qrEmittedCount = 0;
   connectShop(cleanId).catch(err => {
     session.lastError = err.message || String(err);
     session.clientStatus = 'DISCONNECTED';

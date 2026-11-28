@@ -111,8 +111,13 @@ app.use('/api/whatsapp', whatsappRoutes);
 // ── Nightly WhatsApp Summary Scheduler (Runs every 30s) ──────────────────────
 const lastSummarySent = {}; // Key: `${shopId}_${YYYY-MM-DD}`
 
+let lastSummaryCheckedKey = '';
+
 async function checkAndSendScheduledSummaries() {
   const { currentHHMM, dateKey } = getIstTimeParts();
+  const checkKey = `${dateKey}_${currentHHMM}`;
+  if (checkKey === lastSummaryCheckedKey) return;
+  lastSummaryCheckedKey = checkKey;
 
   try {
     const db = await pool.getDb();
@@ -148,7 +153,7 @@ async function checkAndSendScheduledSummaries() {
   } catch {}
 }
 
-setInterval(checkAndSendScheduledSummaries, 30000);
+setInterval(checkAndSendScheduledSummaries, 60000);
 
 app.use('/api/auth', authRateLimiter, authRoutes);
 app.use('/api/superadmin', superAdminRoutes);
@@ -185,9 +190,12 @@ app.use((req, res) => {
   }
 });
 
-// ── Keep-Alive Self-Ping (prevents Render free tier sleep) ────────────────────
+// ── Keep-Alive Self-Ping (shop-hours only so free tier can sleep overnight) ─────
 function startKeepAlive() {
-  // Only run on Render (not locally)
+  if (process.env.DISABLE_KEEP_ALIVE === 'true') {
+    console.log('Keep-alive disabled via DISABLE_KEEP_ALIVE=true.');
+    return;
+  }
   const renderUrl = process.env.RENDER_EXTERNAL_URL || process.env.PUBLIC_URL;
   if (!renderUrl) {
     console.log('Keep-alive: Not on Render, skipping self-ping.');
@@ -195,19 +203,26 @@ function startKeepAlive() {
   }
 
   const pingUrl = renderUrl.replace(/\/$/, '') + '/api/ping';
-  console.log('Keep-alive: Will ping', pingUrl, 'every 10 minutes to prevent sleep.');
+  const keep24x7 = process.env.KEEP_ALIVE_24X7 === 'true';
+  console.log(`Keep-alive: Will ping ${pingUrl} every 12 minutes (${keep24x7 ? '24/7' : '06:30–23:30 IST'}).`);
 
-  // Ping every 10 minutes (600,000 ms)
+  // Ping every 12 minutes; let Render sleep between 23:30 and 06:30 IST to save ~210 free hours/month
   setInterval(() => {
+    if (!keep24x7) {
+      const { currentHHMM } = getIstTimeParts();
+      if (currentHHMM < '06:30' || currentHHMM >= '23:30') {
+        return;
+      }
+    }
     const mod = pingUrl.startsWith('https') ? https : http;
     const req = mod.get(pingUrl, (res) => {
-      console.log('[Keep-alive] Pinged', pingUrl, '→ HTTP', res.statusCode);
+      res.resume();
     });
     req.on('error', (err) => {
       console.warn('[Keep-alive] Ping failed:', err.message);
     });
     req.end();
-  }, 10 * 60 * 1000); // 10 minutes
+  }, 12 * 60 * 1000);
 }
 
 // ── Start Server ──────────────────────────────────────────────────────────────

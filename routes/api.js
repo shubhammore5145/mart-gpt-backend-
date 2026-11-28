@@ -1,70 +1,8 @@
 const express = require('express');
 const router = express.Router();
-const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const pool = require('../db');
-
-const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_jwt_key_123';
-
-// Middleware to verify token and inject shopId
-const authMiddleware = (req, res, next) => {
-  const authHeader = req.headers.authorization;
-  const headerShopId = req.headers['x-shop-id'];
-  const fallbackShopId = headerShopId && headerShopId !== 'default' ? headerShopId : 'mg4q6ov7ym';
-
-  if (!authHeader) {
-    req.user = { uid: 'guest_user', shopId: fallbackShopId, role: 'admin' };
-    return next();
-  }
-
-  const token = authHeader.split(' ')[1];
-  if (!token) {
-    req.user = { uid: 'guest_user', shopId: fallbackShopId, role: 'admin' };
-    return next();
-  }
-
-  if (token.startsWith('sb_')) {
-    try {
-      const [payloadB64] = token.slice(3).split('.');
-      if (!payloadB64) {
-        req.user = { uid: 'guest_user', shopId: fallbackShopId, role: 'admin' };
-        return next();
-      }
-      const payload = JSON.parse(Buffer.from(payloadB64, 'base64').toString('utf8'));
-      const resolvedShop = payload.shopId && payload.shopId !== 'default' ? payload.shopId : fallbackShopId;
-      req.user = { uid: payload.uid || 'local_user', shopId: resolvedShop, role: payload.role || 'admin' };
-      return next();
-    } catch (e) {
-      console.warn('Failed to parse sb_ token, using fallback session:', e.message);
-      req.user = { uid: 'local_user', shopId: fallbackShopId, role: 'admin' };
-      return next();
-    }
-  }
-
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = decoded;
-    if (!req.user.shopId || req.user.shopId === 'default') {
-      req.user.shopId = fallbackShopId;
-    }
-    return next();
-  } catch {
-    try {
-      const decoded = jwt.decode(token);
-      if (decoded && (decoded.uid || decoded.user_id || decoded.sub || decoded.email)) {
-        req.user = {
-          uid: decoded.uid || decoded.user_id || decoded.sub || 'user',
-          shopId: decoded.shopId && decoded.shopId !== 'default' ? decoded.shopId : fallbackShopId,
-          role: decoded.role || 'admin'
-        };
-        return next();
-      }
-    } catch {}
-
-    req.user = { uid: 'staff_user', shopId: fallbackShopId, role: 'admin' };
-    return next();
-  }
-};
+const { requireAuth, isSuperAdminUser } = require('../middleware/auth');
 
 function toOptNum(val) {
   if (val === undefined || val === null || val === '') return null;
@@ -181,34 +119,20 @@ router.post('/coupons/validate', async (req, res) => {
   }
 });
 
-router.use(authMiddleware);
+router.use(requireAuth);
 
 // --- PRODUCTS ---
 router.get('/products', async (req, res) => {
   try {
     const db = await pool.getDb();
-    const rawShopId = req.headers['x-shop-id'] || req.user?.shopId;
-    let targetShopId = rawShopId && rawShopId !== 'default' ? rawShopId : 'mg4q6ov7ym';
+    const targetShopId = req.user.shopId;
 
-    let rows = pool.stripMongoIds(
+    const rows = pool.stripMongoIds(
       await db.collection('products')
         .find({ shopId: targetShopId, isDeleted: { $ne: 1 } })
         .sort({ name: 1 })
         .toArray()
     );
-
-    if ((!rows || rows.length === 0) && targetShopId !== 'mg4q6ov7ym') {
-      const fallbackRows = pool.stripMongoIds(
-        await db.collection('products')
-          .find({ shopId: 'mg4q6ov7ym', isDeleted: { $ne: 1 } })
-          .sort({ name: 1 })
-          .toArray()
-      );
-      if (fallbackRows && fallbackRows.length > 0) {
-        rows = fallbackRows;
-        targetShopId = 'mg4q6ov7ym';
-      }
-    }
 
     const shopDoc = await db.collection('shops').findOne({ shopId: targetShopId }, { projection: { _id: 0, settings: 1 } });
     const shopSettings = parseJsonSafe(shopDoc?.settings, {});
@@ -245,6 +169,16 @@ router.post('/products', async (req, res) => {
     } = req.body;
 
     const productId = id || crypto.randomUUID();
+    if (id) {
+      const existingOwner = await db.collection('products').findOne(
+        { id: productId },
+        { projection: { _id: 0, shopId: 1 } }
+      );
+      if (existingOwner && existingOwner.shopId && existingOwner.shopId !== req.user.shopId) {
+        return res.status(409).json({ error: 'Product ID belongs to another shop.' });
+      }
+    }
+
     const doc = {
       id: productId,
       shopId: req.user.shopId,
@@ -277,7 +211,7 @@ router.post('/products', async (req, res) => {
     };
 
     await db.collection('products').updateOne(
-      { id: productId },
+      { id: productId, shopId: req.user.shopId },
       { $set: doc },
       { upsert: true }
     );
@@ -399,9 +333,18 @@ router.post('/customers', async (req, res) => {
     const db = await pool.getDb();
     const { id, name, phone, address, balance, aadharNumber, photoUrl, aadharPhotoUrl } = req.body;
     const customerId = id || crypto.randomUUID();
+    if (id) {
+      const existingOwner = await db.collection('customers').findOne(
+        { id: customerId },
+        { projection: { _id: 0, shopId: 1 } }
+      );
+      if (existingOwner && existingOwner.shopId && existingOwner.shopId !== req.user.shopId) {
+        return res.status(409).json({ error: 'Customer ID belongs to another shop.' });
+      }
+    }
 
     await db.collection('customers').updateOne(
-      { id: customerId },
+      { id: customerId, shopId: req.user.shopId },
       {
         $set: {
           id: customerId,
@@ -522,9 +465,9 @@ router.get('/transactions', async (req, res) => {
 router.delete('/transactions/:id', async (req, res) => {
   try {
     const db = await pool.getDb();
-    const shopId = req.user?.shopId || 'default';
+    const shopId = req.user.shopId;
     const { permanent } = req.query;
-    const filter = { id: req.params.id, $or: [{ shopId }, { shopId: null }] };
+    const filter = { id: req.params.id, shopId };
 
     if (permanent === 'true') {
       await db.collection('transactions').deleteOne(filter);
@@ -821,6 +764,12 @@ router.put('/shops', async (req, res) => {
 });
 
 router.put('/shops/plan', async (req, res) => {
+  if (!isSuperAdminUser(req.user)) {
+    return res.status(403).json({
+      error: 'Direct plan self-upgrade is disabled. Contact support or Super Admin.'
+    });
+  }
+
   const { plan, planExpiry, couponCode } = req.body;
   try {
     const db = await pool.getDb();
@@ -1212,7 +1161,7 @@ router.post('/staff-attendance', async (req, res) => {
 
       if (existing) {
         await db.collection('staff_attendance').updateOne(
-          { id: existing.id },
+          { id: existing.id, shopId: req.user.shopId },
           { $set: { status: item.status || 'present', notes: item.notes || null } }
         );
       } else {
@@ -1274,7 +1223,7 @@ router.post('/staff-salary-payments', async (req, res) => {
 
     if (type === 'salary' || type === 'advance') {
       try {
-        const staffDoc = await db.collection('staff').findOne({ id: staffId });
+        const staffDoc = await db.collection('staff').findOne({ id: staffId, shopId: req.user.shopId });
         const staffName = staffDoc?.name || 'Staff';
         await db.collection('expenses').insertOne({
           id: crypto.randomUUID(),
@@ -1308,12 +1257,524 @@ router.delete('/staff-salary-payments/:id', async (req, res) => {
   }
 });
 
+// --- SALES RETURNS (PARTIAL + DUPLICATE GUARDED IN MONGODB) ---
+function roundReturnQty(val) {
+  const n = Number(val);
+  if (!Number.isFinite(n)) return 0;
+  return Math.round(n * 1000) / 1000;
+}
+
+class SalesReturnHttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function buildBillLineReturnStates(txItems, priorReturns) {
+  const states = (Array.isArray(txItems) ? txItems : []).map((it, idx) => ({
+    itemIndex: idx,
+    productId: String(it.productId || it.id || '').trim(),
+    name: String(it.name || it.productName || 'Product').trim(),
+    purchasedQty: roundReturnQty(Math.max(0, Number(it.qty || 0))),
+    returnedQty: 0
+  }));
+
+  const unindexed = [];
+  for (const ret of Array.isArray(priorReturns) ? priorReturns : []) {
+    const retItems = Array.isArray(ret.items) ? ret.items : parseJsonSafe(ret.items, []);
+    for (const rItem of retItems) {
+      const rQty = roundReturnQty(Math.max(0, Number(rItem.qty || 0)));
+      if (rQty <= 0) continue;
+      const idx = typeof rItem.itemIndex === 'number' ? rItem.itemIndex : -1;
+      const target = idx >= 0 && idx < states.length ? states[idx] : null;
+      const rPid = String(rItem.productId || '').trim();
+      const rName = String(rItem.productName || '').trim().toLowerCase();
+
+      const matchesIndexed =
+        target &&
+        ((rPid && target.productId && target.productId === rPid) ||
+          (rName && target.name.toLowerCase() === rName) ||
+          (!rPid && !rName));
+
+      if (target && matchesIndexed) {
+        target.returnedQty = roundReturnQty(target.returnedQty + rQty);
+      } else {
+        unindexed.push({ productId: rPid, productName: String(rItem.productName || ''), qty: rQty });
+      }
+    }
+  }
+
+  for (const rItem of unindexed) {
+    let rem = rItem.qty;
+    const rPid = rItem.productId;
+    const rName = rItem.productName.trim().toLowerCase();
+    const candidates = states.filter(
+      (st) => (rPid && st.productId && st.productId === rPid) || (rName && st.name.toLowerCase() === rName)
+    );
+    for (const st of candidates) {
+      if (rem <= 0) break;
+      const cap = roundReturnQty(Math.max(0, st.purchasedQty - st.returnedQty));
+      if (cap > 0) {
+        const take = roundReturnQty(Math.min(cap, rem));
+        st.returnedQty = roundReturnQty(st.returnedQty + take);
+        rem = roundReturnQty(rem - take);
+      }
+    }
+    if (rem > 0 && candidates.length > 0) {
+      candidates[0].returnedQty = roundReturnQty(candidates[0].returnedQty + rem);
+    }
+  }
+
+  return states;
+}
+
+router.get('/sales-returns', async (req, res) => {
+  try {
+    const db = await pool.getDb();
+    const { originalBillId } = req.query;
+    const filter = { shopId: req.user.shopId };
+    if (originalBillId) filter.originalBillId = String(originalBillId);
+
+    const rows = pool.stripMongoIds(
+      await db.collection('sales_returns')
+        .find(filter)
+        .sort({ createdAt: -1 })
+        .limit(500)
+        .toArray()
+    );
+
+    const formatted = rows.map((r) => ({
+      ...r,
+      items: Array.isArray(r.items) ? r.items : parseJsonSafe(r.items, [])
+    }));
+    res.json(formatted);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/sales-returns', async (req, res) => {
+  const {
+    id,
+    originalBillId,
+    customerId,
+    customerName,
+    customerPhone,
+    items,
+    totalRefund,
+    refundMethod,
+    reason,
+    createdAt
+  } = req.body;
+
+  try {
+    const billId = String(originalBillId || '').trim();
+    if (!billId) {
+      return res.status(400).json({ error: 'Original Bill ID is required for a sales return.' });
+    }
+
+    const parsedItems = Array.isArray(items) ? items : parseJsonSafe(items, []);
+    if (!Array.isArray(parsedItems) || parsedItems.length === 0) {
+      return res.status(400).json({ error: 'Please select at least 1 product to return.' });
+    }
+
+    const returnId = String(id || `RET-${Date.now().toString().slice(-8)}-${crypto.randomUUID().slice(0, 4)}`).trim();
+    const createdIso = createdAt ? new Date(createdAt).toISOString() : new Date().toISOString();
+    const normalizedMethod = refundMethod === 'udhar' ? 'credit_note' : (refundMethod || 'cash');
+    const shopId = req.user.shopId;
+
+    let savedRecord = null;
+    const stockUpdates = [];
+
+    await pool.withTransaction(async (db, session) => {
+      const existingReturnWithId = await db.collection('sales_returns').findOne(
+        { id: returnId, shopId },
+        { session }
+      );
+      if (existingReturnWithId) {
+        throw new SalesReturnHttpError(409, 'This sales return has already been recorded.');
+      }
+
+      const [txDoc, priorReturns] = await Promise.all([
+        db.collection('transactions').findOne({ id: billId, shopId }, { session }),
+        db.collection('sales_returns').find({ originalBillId: billId, shopId }, { session }).toArray()
+      ]);
+
+      const normalizedItems = [];
+
+      if (txDoc) {
+        const txItems = Array.isArray(txDoc.items) ? txDoc.items : parseJsonSafe(txDoc.items, []);
+        const lineStates = buildBillLineReturnStates(txItems, priorReturns);
+
+        for (const reqItem of parsedItems) {
+          const reqQty = roundReturnQty(Number(reqItem.qty || 0));
+          const reqName = String(reqItem.productName || reqItem.name || 'Product').trim();
+          const reqPid = String(reqItem.productId || '').trim();
+          if (reqQty <= 0) {
+            throw new SalesReturnHttpError(400, `Return quantity for "${reqName}" must be greater than 0.`);
+          }
+
+          let targetLine = null;
+          if (typeof reqItem.itemIndex === 'number' && reqItem.itemIndex >= 0 && reqItem.itemIndex < lineStates.length) {
+            const candidate = lineStates[reqItem.itemIndex];
+            const idOk = !reqPid || !candidate.productId || candidate.productId === reqPid;
+            const nameOk = !reqName || candidate.name.toLowerCase() === reqName.toLowerCase();
+            if (idOk || nameOk) {
+              targetLine = candidate;
+            }
+          }
+
+          if (!targetLine) {
+            const matches = lineStates.filter(
+              (st) => (reqPid && st.productId && st.productId === reqPid) || st.name.toLowerCase() === reqName.toLowerCase()
+            );
+            targetLine = matches.find((st) => roundReturnQty(st.purchasedQty - st.returnedQty) > 0.0001) || matches[0] || null;
+          }
+
+          if (!targetLine) {
+            throw new SalesReturnHttpError(400, `"${reqName}" was not found in Bill #${billId.slice(-8).toUpperCase()}.`);
+          }
+
+          const remaining = roundReturnQty(Math.max(0, targetLine.purchasedQty - targetLine.returnedQty));
+          if (remaining <= 0.0001) {
+            throw new SalesReturnHttpError(409, `"${targetLine.name}" is already returned on this bill.`);
+          }
+          if (reqQty > remaining + 0.0001) {
+            throw new SalesReturnHttpError(
+              400,
+              `Cannot return ${reqQty} of "${targetLine.name}". Only ${remaining} remaining on this bill.`
+            );
+          }
+
+          // Reserve this quantity immediately so duplicate rows in the same request cannot bypass the cap
+          targetLine.returnedQty = roundReturnQty(targetLine.returnedQty + reqQty);
+
+          const unitPrice = Number(reqItem.sellingPrice || 0);
+          const itemRefund = reqItem.refundAmount !== undefined ? Number(reqItem.refundAmount) : roundReturnQty(unitPrice * reqQty);
+          normalizedItems.push({
+            itemIndex: targetLine.itemIndex,
+            productId: targetLine.productId || reqPid,
+            productName: targetLine.name || reqName,
+            qty: reqQty,
+            purchasedQty: targetLine.purchasedQty,
+            sellingPrice: unitPrice,
+            refundAmount: Number(itemRefund.toFixed(2)),
+            condition: reqItem.condition === 'damaged' ? 'damaged' : 'resellable'
+          });
+        }
+      } else {
+        // Fallback for offline-created bills not yet synced: still guard duplicates via priorReturns
+        const returnedMap = new Map();
+        for (const pRet of priorReturns) {
+          const pItems = Array.isArray(pRet.items) ? pRet.items : parseJsonSafe(pRet.items, []);
+          for (const it of pItems) {
+            const key = String(it.productId || it.productName || '').trim().toLowerCase();
+            if (!key) continue;
+            returnedMap.set(key, roundReturnQty((returnedMap.get(key) || 0) + Number(it.qty || 0)));
+          }
+        }
+
+        for (const reqItem of parsedItems) {
+          const reqQty = roundReturnQty(Number(reqItem.qty || 0));
+          const reqName = String(reqItem.productName || reqItem.name || 'Product').trim();
+          const reqPid = String(reqItem.productId || '').trim();
+          const key = String(reqPid || reqName).trim().toLowerCase();
+          if (reqQty <= 0) {
+            throw new SalesReturnHttpError(400, `Return quantity for "${reqName}" must be greater than 0.`);
+          }
+
+          const purchased = reqItem.purchasedQty !== undefined ? roundReturnQty(Number(reqItem.purchasedQty)) : null;
+          const alreadyRet = returnedMap.get(key) || 0;
+          if (purchased !== null) {
+            const remaining = roundReturnQty(Math.max(0, purchased - alreadyRet));
+            if (remaining <= 0.0001) {
+              throw new SalesReturnHttpError(409, `"${reqName}" is already returned on this bill.`);
+            }
+            if (reqQty > remaining + 0.0001) {
+              throw new SalesReturnHttpError(400, `Cannot return ${reqQty} of "${reqName}". Only ${remaining} remaining.`);
+            }
+          }
+          returnedMap.set(key, roundReturnQty(alreadyRet + reqQty));
+
+          const unitPrice = Number(reqItem.sellingPrice || 0);
+          const itemRefund = reqItem.refundAmount !== undefined ? Number(reqItem.refundAmount) : roundReturnQty(unitPrice * reqQty);
+          normalizedItems.push({
+            ...(typeof reqItem.itemIndex === 'number' ? { itemIndex: reqItem.itemIndex } : {}),
+            productId: reqPid,
+            productName: reqName,
+            qty: reqQty,
+            ...(purchased !== null ? { purchasedQty: purchased } : {}),
+            sellingPrice: unitPrice,
+            refundAmount: Number(itemRefund.toFixed(2)),
+            condition: reqItem.condition === 'damaged' ? 'damaged' : 'resellable'
+          });
+        }
+      }
+
+      const computedTotalRefund = normalizedItems.reduce((sum, it) => sum + Number(it.refundAmount || 0), 0);
+      const finalTotalRefund = Number((totalRefund !== undefined ? Number(totalRefund) : computedTotalRefund).toFixed(2));
+      const resolvedCustomerId = customerId || txDoc?.customerId || null;
+
+      savedRecord = {
+        id: returnId,
+        shopId,
+        originalBillId: billId,
+        customerId: resolvedCustomerId,
+        customerName: customerName || txDoc?.customerName || 'Walk-in Customer',
+        customerPhone: customerPhone || txDoc?.customerPhone || '',
+        items: normalizedItems,
+        totalRefund: finalTotalRefund,
+        refundMethod: normalizedMethod,
+        reason: String(reason || 'Customer Return'),
+        createdAt: createdIso
+      };
+
+      await db.collection('sales_returns').insertOne(savedRecord, { session });
+
+      for (const item of normalizedItems) {
+        if (item.condition === 'resellable') {
+          let targetProd = null;
+          if (item.productId) {
+            targetProd = await db.collection('products').findOne(
+              { id: item.productId, shopId, isDeleted: { $ne: 1 } },
+              { session }
+            );
+          }
+          if (!targetProd && item.productName) {
+            targetProd = await db.collection('products').findOne(
+              {
+                shopId,
+                isDeleted: { $ne: 1 },
+                name: { $regex: new RegExp(`^${pool.escapeRegex(item.productName)}$`, 'i') }
+              },
+              { session }
+            );
+          }
+
+          if (targetProd) {
+            const prevStock = roundReturnQty(Number(targetProd.stock || 0));
+            const newStock = roundReturnQty(prevStock + item.qty);
+            await db.collection('products').updateOne(
+              { id: targetProd.id, shopId },
+              { $set: { stock: newStock } },
+              { session }
+            );
+            stockUpdates.push({
+              productId: targetProd.id,
+              productName: targetProd.name,
+              qty: item.qty,
+              previousStock: prevStock,
+              newStock
+            });
+          }
+        }
+      }
+
+      if (normalizedMethod === 'credit_note' && resolvedCustomerId && finalTotalRefund > 0) {
+        const custDoc = await db.collection('customers').findOne(
+          { id: resolvedCustomerId, shopId, isDeleted: { $ne: 1 } },
+          { session }
+        );
+        if (custDoc) {
+          await db.collection('customers').updateOne(
+            { id: resolvedCustomerId, shopId },
+            { $inc: { balance: -finalTotalRefund } },
+            { session }
+          );
+          await db.collection('udhar_transactions').insertOne(
+            {
+              id: crypto.randomUUID(),
+              shopId,
+              customerId: resolvedCustomerId,
+              amount: finalTotalRefund,
+              type: 'payment',
+              notes: `Sales Return Credit #${returnId} (Bill #${billId.slice(-8).toUpperCase()})`,
+              createdAt: createdIso
+            },
+            { session }
+          );
+        }
+      }
+    });
+
+    res.json({
+      success: true,
+      returnRecord: savedRecord,
+      stockUpdates,
+      stockRestocked: true
+    });
+  } catch (err) {
+    if (err instanceof SalesReturnHttpError) {
+      return res.status(err.status).json({ error: err.message });
+    }
+    console.error('Sales Return Error:', err);
+    res.status(500).json({ error: err.message || 'Failed to process sales return.' });
+  }
+});
+
+// --- DAMAGED GOODS & WRITE-OFFS ---
+router.get('/damaged-goods', async (req, res) => {
+  try {
+    const db = await pool.getDb();
+    const rows = pool.stripMongoIds(
+      await db.collection('damaged_goods')
+        .find({ shopId: req.user.shopId })
+        .sort({ createdAt: -1 })
+        .limit(500)
+        .toArray()
+    );
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/damaged-goods', async (req, res) => {
+  try {
+    const db = await pool.getDb();
+    const { id, productId, productName, qty, costPrice, totalLoss, reason, notes, createdAt } = req.body;
+    const itemId = id || crypto.randomUUID();
+    const doc = {
+      id: itemId,
+      shopId: req.user.shopId,
+      productId: String(productId || ''),
+      productName: String(productName || 'Product'),
+      qty: Number(qty || 0),
+      costPrice: Number(costPrice || 0),
+      totalLoss: Number(totalLoss || 0),
+      reason: String(reason || 'other'),
+      notes: notes ? String(notes) : '',
+      createdAt: createdAt ? new Date(createdAt).toISOString() : new Date().toISOString(),
+      addedBy: req.user.uid
+    };
+    await db.collection('damaged_goods').updateOne(
+      { id: itemId, shopId: req.user.shopId },
+      { $set: doc },
+      { upsert: true }
+    );
+    res.json({ success: true, item: doc });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.delete('/damaged-goods/:id', async (req, res) => {
+  try {
+    const db = await pool.getDb();
+    await db.collection('damaged_goods').deleteOne({ id: req.params.id, shopId: req.user.shopId });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- STOCK MOVEMENTS (AUDIT TRAIL) ---
+router.get('/stock-movements', async (req, res) => {
+  try {
+    const db = await pool.getDb();
+    const filter = { shopId: req.user.shopId };
+    if (req.query.productId) filter.productId = String(req.query.productId);
+    const rows = pool.stripMongoIds(
+      await db.collection('stock_movements')
+        .find(filter)
+        .sort({ createdAt: -1 })
+        .limit(500)
+        .toArray()
+    );
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/stock-movements', async (req, res) => {
+  try {
+    const db = await pool.getDb();
+    const { id, productId, productName, type, qty, previousStock, newStock, reason, referenceId, createdAt } = req.body;
+    const movId = id || crypto.randomUUID();
+    const doc = {
+      id: movId,
+      shopId: req.user.shopId,
+      productId: String(productId || ''),
+      productName: String(productName || 'Product'),
+      type: String(type || 'audit_adjustment'),
+      qty: Number(qty || 0),
+      previousStock: Number(previousStock || 0),
+      newStock: Number(newStock || 0),
+      reason: reason ? String(reason) : '',
+      referenceId: referenceId ? String(referenceId) : undefined,
+      createdAt: createdAt ? new Date(createdAt).toISOString() : new Date().toISOString(),
+      addedBy: req.user.uid
+    };
+    await db.collection('stock_movements').updateOne(
+      { id: movId, shopId: req.user.shopId },
+      { $set: doc },
+      { upsert: true }
+    );
+    res.json({ success: true, movement: doc });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- CASH COUNTER / REGISTER SHIFT CLOSINGS ---
+router.get('/cash-counter', async (req, res) => {
+  try {
+    const db = await pool.getDb();
+    const rows = pool.stripMongoIds(
+      await db.collection('cash_counter_closings')
+        .find({ shopId: req.user.shopId })
+        .sort({ closedAt: -1 })
+        .limit(365)
+        .toArray()
+    );
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/cash-counter', async (req, res) => {
+  try {
+    const db = await pool.getDb();
+    const {
+      id, cashierName, openingCash, cashSales, cashReturns, cashExpenses,
+      expectedCash, actualCountedCash, discrepancy, notes, closedAt
+    } = req.body;
+    const closingId = id || crypto.randomUUID();
+    const doc = {
+      id: closingId,
+      shopId: req.user.shopId,
+      cashierName: String(cashierName || req.user.uid || 'Cashier'),
+      openingCash: Number(openingCash || 0),
+      cashSales: Number(cashSales || 0),
+      cashReturns: Number(cashReturns || 0),
+      cashExpenses: Number(cashExpenses || 0),
+      expectedCash: Number(expectedCash || 0),
+      actualCountedCash: Number(actualCountedCash || 0),
+      discrepancy: Number(discrepancy || 0),
+      notes: notes ? String(notes) : '',
+      closedAt: closedAt ? new Date(closedAt).toISOString() : new Date().toISOString(),
+      createdBy: req.user.uid
+    };
+    await db.collection('cash_counter_closings').updateOne(
+      { id: closingId, shopId: req.user.shopId },
+      { $set: doc },
+      { upsert: true }
+    );
+    res.json({ success: true, closing: doc });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // --- RECYCLE BIN ---
 router.get('/recycle-bin', async (req, res) => {
   try {
     const db = await pool.getDb();
-    const shopId = req.user?.shopId || 'default';
-    const filter = { $or: [{ shopId }, { shopId: null }], isDeleted: 1 };
+    const shopId = req.user.shopId;
+    const filter = { shopId, isDeleted: 1 };
 
     const [deletedProducts, deletedTransactions, deletedCustomers] = await Promise.all([
       db.collection('products').find(filter, { projection: { _id: 0 } }).sort({ deletedAt: -1, createdAt: -1 }).toArray(),
@@ -1340,7 +1801,7 @@ router.get('/recycle-bin', async (req, res) => {
 
 router.post('/recycle-bin/restore', async (req, res) => {
   const { type, id } = req.body;
-  const shopId = req.user?.shopId || 'default';
+  const shopId = req.user.shopId;
   const collectionMap = {
     product: 'products',
     transaction: 'transactions',
@@ -1352,7 +1813,7 @@ router.post('/recycle-bin/restore', async (req, res) => {
   try {
     const db = await pool.getDb();
     await db.collection(col).updateOne(
-      { id, $or: [{ shopId }, { shopId: null }] },
+      { id, shopId },
       { $set: { isDeleted: 0, deletedAt: null } }
     );
     res.json({ success: true });
@@ -1363,7 +1824,7 @@ router.post('/recycle-bin/restore', async (req, res) => {
 
 router.post('/recycle-bin/purge', async (req, res) => {
   const { type, id } = req.body;
-  const shopId = req.user?.shopId || 'default';
+  const shopId = req.user.shopId;
   const collectionMap = {
     product: 'products',
     transaction: 'transactions',
@@ -1374,7 +1835,7 @@ router.post('/recycle-bin/purge', async (req, res) => {
 
   try {
     const db = await pool.getDb();
-    await db.collection(col).deleteOne({ id, $or: [{ shopId }, { shopId: null }], isDeleted: 1 });
+    await db.collection(col).deleteOne({ id, shopId, isDeleted: 1 });
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1382,8 +1843,8 @@ router.post('/recycle-bin/purge', async (req, res) => {
 });
 
 router.post('/recycle-bin/empty', async (req, res) => {
-  const shopId = req.user?.shopId || 'default';
-  const filter = { $or: [{ shopId }, { shopId: null }], isDeleted: 1 };
+  const shopId = req.user.shopId;
+  const filter = { shopId, isDeleted: 1 };
   try {
     const db = await pool.getDb();
     await Promise.all([

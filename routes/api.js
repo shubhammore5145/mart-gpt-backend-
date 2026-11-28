@@ -28,12 +28,15 @@ router.get('/public/receipt/:id', async (req, res) => {
   try {
     const db = await pool.getDb();
     const rawId = String(req.params.id || '').trim();
-    if (!rawId) return res.status(404).json({ error: 'Receipt not found' });
+    if (!rawId || rawId.length < 8) {
+      return res.status(404).json({ error: 'Receipt not found' });
+    }
 
-    const idRegex = new RegExp(pool.escapeRegex(rawId), 'i');
+    // Match exact UUID or anchored suffix (>=8 chars) so short partial IDs cannot enumerate other stores' bills
+    const suffixRegex = new RegExp(`${pool.escapeRegex(rawId)}$`, 'i');
     const txDoc = pool.stripMongoId(
       await db.collection('transactions')
-        .find({ $or: [{ id: rawId }, { id: { $regex: idRegex } }] })
+        .find({ $or: [{ id: rawId }, { id: { $regex: suffixRegex } }], isDeleted: { $ne: 1 } })
         .sort({ createdAt: -1 })
         .limit(1)
         .next()
@@ -1655,6 +1658,9 @@ router.post('/damaged-goods', async (req, res) => {
     );
     res.json({ success: true, item: doc });
   } catch (err) {
+    if (err?.code === 11000) {
+      return res.status(409).json({ error: 'Damaged good record ID belongs to another shop.' });
+    }
     res.status(500).json({ error: err.message });
   }
 });
@@ -1714,6 +1720,9 @@ router.post('/stock-movements', async (req, res) => {
     );
     res.json({ success: true, movement: doc });
   } catch (err) {
+    if (err?.code === 11000) {
+      return res.status(409).json({ error: 'Stock movement record ID belongs to another shop.' });
+    }
     res.status(500).json({ error: err.message });
   }
 });
@@ -1765,6 +1774,9 @@ router.post('/cash-counter', async (req, res) => {
     );
     res.json({ success: true, closing: doc });
   } catch (err) {
+    if (err?.code === 11000) {
+      return res.status(409).json({ error: 'Cash counter record ID belongs to another shop.' });
+    }
     res.status(500).json({ error: err.message });
   }
 });

@@ -138,13 +138,25 @@ router.post('/login', async (req, res) => {
     delete user.password;
     user.permissions = normalizePermissions(user.permissions);
 
-    const token = jwt.sign({ uid: user.uid, shopId: user.shopId, role: user.role }, JWT_SECRET, { expiresIn: '7d' });
+    let shop = user.shopId
+      ? pool.stripMongoId(await db.collection('shops').findOne({ shopId: user.shopId }))
+      : null;
 
-    let shop = pool.stripMongoId(await db.collection('shops').findOne({ shopId: user.shopId }));
-    if (!shop && user.shopId) {
+    if (!shop && !user.shopId && user.email) {
+      shop = pool.stripMongoId(
+        await db.collection('shops').findOne({ email: { $regex: new RegExp(`^${pool.escapeRegex(user.email.trim().toLowerCase())}$`, 'i') } })
+      );
+      if (shop?.shopId) {
+        await db.collection('users').updateOne({ uid: user.uid }, { $set: { shopId: shop.shopId } });
+        user.shopId = shop.shopId;
+      }
+    }
+
+    if (!shop && user.role === 'admin') {
       try {
+        const resolvedId = user.shopId || generateId();
         const fallbackShop = {
-          shopId: user.shopId,
+          shopId: resolvedId,
           name: user.displayName ? `${user.displayName} Store` : 'MartGPT Store',
           ownerName: user.displayName || 'Owner',
           email: user.email,
@@ -153,11 +165,21 @@ router.post('/login', async (req, res) => {
           createdAt: new Date().toISOString()
         };
         await db.collection('shops').insertOne({ ...fallbackShop });
+        if (!user.shopId) {
+          await db.collection('users').updateOne({ uid: user.uid }, { $set: { shopId: resolvedId } });
+          user.shopId = resolvedId;
+        }
         shop = fallbackShop;
       } catch (err) {
         console.warn('Fallback shop auto-creation in login:', err.message);
       }
     }
+
+    if (!user.shopId) {
+      return res.status(403).json({ error: 'Account is not linked to any shop. Please contact store admin.' });
+    }
+
+    const token = jwt.sign({ uid: user.uid, shopId: user.shopId, role: user.role }, JWT_SECRET, { expiresIn: '7d' });
 
     res.json({ token, user, shop });
   } catch (error) {

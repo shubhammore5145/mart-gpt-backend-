@@ -119,7 +119,8 @@ async function ensureIndexes(db) {
     db.collection('stock_movements').createIndex({ id: 1 }, { unique: true }),
     db.collection('stock_movements').createIndex({ shopId: 1, createdAt: -1 }),
     db.collection('cash_counter_closings').createIndex({ id: 1 }, { unique: true }),
-    db.collection('cash_counter_closings').createIndex({ shopId: 1, closedAt: -1 })
+    db.collection('cash_counter_closings').createIndex({ shopId: 1, closedAt: -1 }),
+    db.collection('whatsapp_sessions').createIndex({ shopId: 1 }, { unique: true })
   ]);
 }
 
